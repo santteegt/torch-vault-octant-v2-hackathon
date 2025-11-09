@@ -2,65 +2,46 @@
 pragma solidity ^0.8.25;
 
 import { BaseYieldSkimmingStrategy } from "@octant-core/strategies/yieldSkimming/BaseYieldSkimmingStrategy.sol";
-// import { BaseYieldSkimmingHealthCheck } from "@octant-core/strategies/periphery/BaseYieldSkimmingHealthCheck.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IERC4626 } from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { BETH } from "@beth/BETH.sol";
 
-// // ============================================
-// // INTERFACES
-// // ============================================
-
-// /// @notice RocketPool deposit pool interface
-// /// @dev Used to deposit ETH and receive rETH
-// interface IRocketDepositPool {
-//     function deposit() external payable;
-//     function getMaximumDepositAmount() external view returns (uint256);
-// }
-
-// /// @notice RocketPool rETH token interface
-// /// @dev Used for exchange rate and burn mechanism
-// interface IRocketTokenRETH {
-//     /// @notice Get the current exchange rate
-//     function getExchangeRate() external view returns (uint256);
-//     /// @notice Get the total amount of collateral available
-//     function getTotalCollateral() external view returns (uint256);
-//     /// @notice Burn rETH to get ETH
-//     function burn(uint256 _rethAmount) external returns (uint256);
-// }
-
 /**
  * @title YieldBethStrategy
- * @author [Golem Foundation](https://golem.foundation)
- * @custom:security-contact security@golem.foundation
- * @notice Yield skimming strategy that accepts ETH deposits, converts to rETH via RocketPool,
- *         enforces per-user lockup periods, and converts rETH back to ETH via burn mechanism
- *         before depositing into BETH contract on withdrawal.
- * @dev Extends BaseYieldSkimmingStrategy to capture yield from rETH appreciation.
+ * @author Santiago Gonzalez
+ * @notice Yield skimming strategy base contract that accepts ETH deposits, converts to <yield>ETH (e.g. rETH),
+ *         enforces per-user lockup periods, and finally converts <yield>ETH back to ETH, and applies a burn mechanism
+ *         by depositing into the BETH contract on withdrawal.
+ *         BETH is a 1:1 token that represents ETH burned.
+ *         This strategy is designed to be used by protocols and L2s within the Ethereum ecosystem that has 
+ *         defined some form of mechanism that burns ETH from fees payed by users.
+ *         Instead of just burning ETH and waiting for the asset to appreciate over time
+ *         (hoping this effect is not cancelled by other market factors), this strategy allows them to put
+ *         this ETH to work in favour of a good cause (e.g. public goods funding) for a specific period of time
+ *         while compromising that at the depostied ETH will be burned after the lockup period.
+ *         ETH is burned via BETH contract to allow project to get a proof-of-burn in return as a transparent
+ *         and composable primitive that can be used in the future.
+ * @dev Extends BaseYieldSkimmingStrategy to capture yield from <yield>ETH appreciation.
  *
  *      STRATEGY FLOW:
- *      1. Deposit: User deposits ETH → Convert to rETH via RocketPool deposit pool
- *      2. Lockup: Track per-user deposit timestamps, enforce lockup period
- *      3. Withdrawal: Check lockup → Burn rETH to ETH → Deposit ETH to BETH → Transfer BETH to user
+ *      1. Deposit: User deposits ETH → Convert to <yield>ETH via yield bearing protocol's deposit pool
+ *      2. Lockup: Track per-user deposit timestamps and enforce lockup period
+ *      3. Withdrawal: Check lockup → Burn <yield>ETH to ETH → Deposit ETH to BETH → Transfer BETH to user
  *
  *      LOCKUP MECHANISM:
  *      - Each user's deposit timestamp is updated on every deposit
  *      - Withdrawals only allowed after lockupPeriod has elapsed since last deposit
  *      - Lockup period resets on each new deposit
  *
- *      ROCKETPOOL INTEGRATION:
- *      - Deposit: ETH → rETH via RocketDepositPool.deposit()
- *      - Withdrawal: rETH → ETH via RocketTokenRETH.burn()
- *      - Exchange rate tracked via RocketTokenRETH.getExchangeRate()
+ *      YIELD ETH INTEGRATION:
+ *      - Contract must implement _stakeETH and _unstakeETH functions to handle the conversion of ETH to <yield>ETH
+ *      - Contract must implement _getCurrentExchangeRate and decimalsOfExchangeRate functions to handle the exchange rate of <yield>ETH
  *
  *      BETH INTEGRATION:
- *      - On withdrawal, ETH from rETH burn is deposited into BETH contract
+ *      - On withdrawal, ETH from <yield>ETH burn is deposited into BETH contract
  *      - User receives BETH tokens instead of ETH
- *
- * @custom:security Lockup period prevents early withdrawals
- * @custom:security Exchange rate from RocketPool (trusted source)
  */
 abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -97,10 +78,6 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
     error LockupPeriodNotExpired();
     /// @notice Thrown when ETH deposit fails
     error ETHDepositFailed();
-    /// @notice Thrown when Yield ETH burn fails
-    error YieldETHBurnFailed();
-    /// @notice Thrown when BETH deposit fails
-    error BETHDepositFailed();
 
     // ============================================
     // EVENTS
@@ -118,7 +95,7 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
 
     /**
      * @notice Initializes the Yield Beth Strategy
-     * @param _asset Address of rETH token (the strategy's underlying asset)
+     * @param _asset Address of <yield>ETH token (the strategy's underlying asset)
      * @param _name Strategy name
      * @param _management Address with management role
      * @param _keeper Address with keeper role
@@ -153,12 +130,7 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
         )
     {
         lockupPeriod = _lockupPeriod;
-        // YIELD_ETH_DEPOSIT_POOL_ADDRESS = _rocketDepositPool;
-        // YIELD_ETH_TOKEN_ADDRESS = _rocketTokenRETH;
         bethContract = _bethContract;
-
-        // // Approve rETH for burning (unlimited approval)
-        // IERC20(_asset).forceApprove(_rocketTokenRETH, type(uint256).max);
     }
 
     // ============================================
@@ -168,10 +140,10 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
     function _stakeETH(uint256 _amount) internal virtual returns (uint256);
 
     /**
-     * @notice Accepts ETH deposits, converts to rETH, and deposits into strategy
-     * @dev Custom deposit function that handles ETH → rETH conversion
+     * @notice Accepts ETH deposits, converts to <yield>ETH, and deposits into strategy
+     * @dev Custom deposit function that handles ETH → <yield>ETH conversion
      *      Updates user's deposit timestamp on every deposit
-     *      Then calls TokenizedStrategy's deposit with rETH
+     *      Then calls TokenizedStrategy's deposit with <yield>ETH
      * @param assets Amount of assets to deposit (or type(uint256).max for full balance)
      * @param receiver Address to receive the minted shares
      * @return shares Amount of shares minted to receiver
@@ -182,22 +154,16 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
             revert ETHDepositFailed();
         }
 
-        // // Convert ETH to rETH via RocketPool deposit pool
-        // IRocketDepositPool(rocketDepositPool).deposit{value: msg.value}();
-
-        // // Get the rETH received (should be less than ETH due to exchange rate)
-        // uint256 rethReceived = IERC20(asset).balanceOf(address(this));
-
         uint256 yieldEthReceived = _stakeETH(assets);
 
         // Update user's deposit timestamp (resets lockup period)
         // Use _receiver as the user, not msg.sender (in case of deposit for another)
         userDepositTimestamps[receiver] = block.timestamp;
 
-        // // Approve rETH for TokenizedStrategy deposit
-        // IERC20(asset).forceApprove(address(this), rethReceived);
+        // TODO: Approve <yield>ETH for TokenizedStrategy deposit
+        asset.approve(address(this), yieldEthReceived);
 
-        // Call TokenizedStrategy's deposit with rETH via delegatecall
+        // Call TokenizedStrategy's deposit with <yield>ETH via delegatecall
         // This will call _deployFunds which is a no-op for yield skimming
         bytes memory result = _delegateCall(
             abi.encodeWithSignature("deposit(uint256,address)", yieldEthReceived, receiver)
@@ -208,14 +174,6 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
     receive() external payable {
         deposit(msg.value, msg.sender);
     }
-
-    // // ============================================
-    // // REQUIRED OVERRIDES
-    // // ============================================
-
-    // // Note: We cannot override _deployFunds, _freeFunds, or _harvestAndReport
-    // // because BaseYieldSkimmingStrategy doesn't mark them as virtual.
-    // // Instead, we handle conversions in withdraw/redeem functions.
 
     // /**
     //  * @notice Helper function to convert rETH to BETH
@@ -259,7 +217,7 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
 
     /**
      * @notice Override withdraw to handle lockup check and BETH conversion
-     * @dev Checks lockup period, calculates shares, burns rETH to ETH, deposits ETH to BETH,
+     * @dev Checks lockup period, calculates shares, burns <yield>ETH to ETH, deposits ETH to BETH,
      *      calls parent to handle share accounting, and transfers BETH to receiver
      * @param _assets Amount of assets to withdraw
      * @param _receiver Address to receive assets

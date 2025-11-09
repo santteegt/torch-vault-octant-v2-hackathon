@@ -27,6 +27,19 @@ interface IRocketTokenRETH {
     function burn(uint256 _rethAmount) external returns (uint256);
 }
 
+/**
+ * @title RocketPoolYieldBethStrategy
+ * @author Santiago Gonzalez
+ * @notice Yield skimming strategy that accepts ETH deposits, converts to rETH via RocketPool,
+ *         enforces per-user lockup periods, and converts rETH back to ETH via burn mechanism
+ *         before depositing into BETH contract on withdrawal.
+ * @dev Extends YieldBethStrategy to capture yield from rETH appreciation.
+ *
+ *      ROCKETPOOL INTEGRATION:
+ *      - Deposit: ETH → rETH via RocketDepositPool.deposit()
+ *      - Withdrawal: rETH → ETH via RocketTokenRETH.burn()
+ *      - Exchange rate tracked via RocketTokenRETH.getExchangeRate()
+ */
 contract RocketPoolYieldBethStrategy is YieldBethStrategy {
 
     /// @notice Address of RocketPool deposit pool contract
