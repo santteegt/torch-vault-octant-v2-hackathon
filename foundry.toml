@@ -3,6 +3,9 @@ src = 'src'
 out = 'out'
 libs = ["dependencies"]
 solc = "0.8.25"
+via_ir = true
+optimizer = true
+optimizer_runs = 200
 
 
 [soldeer]
@@ -10,6 +13,7 @@ recursive_deps = true
 
 [dependencies]
 forge-std = { version = "1.11.0" }
+beth = { version = "1.0.0", git = "https://github.com/ETHCF/beth" }
 tokenized-strategy = { version = "3.0.4", git = "https://github.com/yearn/tokenized-strategy", tag = "v3.0.4" }
 tokenized-strategy-periphery = { version = "3.0.2", git = "https://github.com/yearn/tokenized-strategy-periphery", tag = "v3.0.2" }
 "@openzeppelin-contracts" = { version = "5.3.0", git = "https://github.com/OpenZeppelin/openzeppelin-contracts", tag = "v5.3.0" }
