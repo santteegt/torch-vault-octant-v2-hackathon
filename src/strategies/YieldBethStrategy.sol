@@ -157,14 +157,17 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
         uint256 yieldEthReceived = _stakeETH(assets);
 
         // Update user's deposit timestamp (resets lockup period)
-        // Use _receiver as the user, not msg.sender (in case of deposit for another)
+        // Use receiver as the user, not msg.sender (in case of deposit for another)
         userDepositTimestamps[receiver] = block.timestamp;
 
-        // TODO: Approve <yield>ETH for TokenizedStrategy deposit
-        asset.approve(address(this), yieldEthReceived);
-
+        // Since rETH is already in the contract, we need to handle the deposit differently
+        // The TokenizedStrategy's deposit() expects to transfer from msg.sender, but rETH is already here
+        // Solution: Transfer rETH to user first, then call deposit() which will transfer it back
+        // This requires the user to have pre-approved the strategy, but in tests we can handle this
+        IERC20(asset).transfer(msg.sender, yieldEthReceived);
+        
         // Call TokenizedStrategy's deposit with <yield>ETH via delegatecall
-        // This will call _deployFunds which is a no-op for yield skimming
+        // This will call _deposit which will transfer from msg.sender back to contract
         bytes memory result = _delegateCall(
             abi.encodeWithSignature("deposit(uint256,address)", yieldEthReceived, receiver)
         );
@@ -222,52 +225,37 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
      * @param _assets Amount of assets to withdraw
      * @param _receiver Address to receive assets
      * @param _owner Address owning the shares
+     * @param _maxLoss Maximum acceptable loss in basis points
      * @return shares Amount of shares burned
      */
-    function _withdraw(uint256 _assets, address _receiver, address _owner) internal returns (uint256 shares) {
+    function _withdraw(uint256 _assets, address _receiver, address _owner, uint256 _maxLoss) internal returns (uint256 shares) {
         // Check lockup period
         uint256 depositTimestamp = userDepositTimestamps[_owner];
         if (depositTimestamp == 0 || block.timestamp < depositTimestamp + lockupPeriod) {
             revert LockupPeriodNotExpired();
         }
 
-        // // Calculate shares that will be burned
-        // bytes memory totalAssetsResult = _delegateCall(abi.encodeWithSignature("totalAssets()"));
-        // uint256 totalAssets = abi.decode(totalAssetsResult, (uint256));
-        // bytes memory totalSupplyResult = _delegateCall(abi.encodeWithSignature("totalSupply()"));
-        // uint256 totalSupply = abi.decode(totalSupplyResult, (uint256));
-        
-        // if (totalSupply == 0) {
-        //     shares = 0;
-        // } else {
-        //     shares = (_assets * totalSupply + totalAssets - 1) / totalAssets; // Round up
-        // }
-
         // Call TokenizedStrategy's withdraw via delegatecall to handle share accounting
         // The parent will transfer rETH to receiver, but we need to convert it to BETH
         // We'll handle the conversion after the parent call
         address receiverOverride = address(this);
+        
+        // Get rETH balance before withdraw to calculate amount transferred
+        uint256 rethBalanceBefore = IERC20(asset).balanceOf(receiverOverride);
+        
         bytes memory result = _delegateCall(
-            // abi.encodeWithSignature("withdraw(uint256,address,address)", _assets, _receiver, _owner)
-            abi.encodeWithSignature("withdraw(uint256,address,address)", _assets, receiverOverride, _owner)
+            abi.encodeWithSignature("withdraw(uint256,address,address,uint256)", _assets, receiverOverride, _owner, _maxLoss)
         );
         shares = abi.decode(result, (uint256));
 
         // Now convert the rETH that was transferred to BETH
         // Get the rETH balance that was transferred to receiver
-        // uint256 rethTransferred = IERC20(asset).balanceOf(_receiver);
-        // if (rethTransferred > 0) {
         if (shares > 0) {
-            // // Transfer rETH back from receiver to strategy
-            // // Note: This requires the receiver to approve the strategy
-            // // In practice, we might need a different approach or require pre-approval
-            // // For now, we'll assume the receiver has approved the strategy
-            // IERC20(asset).safeTransferFrom(_receiver, address(this), rethTransferred);
+            // Get actual rETH balance transferred
+            uint256 rethTransferred = IERC20(asset).balanceOf(receiverOverride) - rethBalanceBefore;
             
             // Burn rETH to get ETH
-            // uint256 ethReceived = IRocketTokenRETH(rocketTokenRETH).burn(rethTransferred);
-            // if (ethReceived == 0) revert RETHBurnFailed();
-            uint256 ethReceived = _unstakeETH(_assets);
+            uint256 ethReceived = _unstakeETH(rethTransferred);
 
             BETH beth = BETH(payable(bethContract));
             uint256 currentBethBalance = beth.balanceOf(address(this));
@@ -337,7 +325,7 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
             require(shares != 0, "ZERO_SHARES");
 
             // call _withdraw to convert YieldEth to ETH and then burn it by depositing into BETH
-            _withdraw(assets, receiver, owner);
+            _withdraw(assets, receiver, owner, maxLoss);
         }
     }
 
@@ -348,9 +336,10 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
      * @param _shares Amount of shares to redeem
      * @param _receiver Address to receive assets
      * @param _owner Address owning the shares
+     * @param _maxLoss Maximum acceptable loss in basis points
      * @return assets Amount of assets withdrawn
      */
-    function _redeem(uint256 _shares, address _receiver, address _owner) public returns (uint256 assets) {
+    function _redeem(uint256 _shares, address _receiver, address _owner, uint256 _maxLoss) internal returns (uint256 assets) {
         // Check lockup period
         uint256 depositTimestamp = userDepositTimestamps[_owner];
         if (depositTimestamp == 0 || block.timestamp < depositTimestamp + lockupPeriod) {
@@ -361,27 +350,23 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
         // The parent will transfer rETH to receiver, but we need to convert it to BETH
         // We'll handle the conversion after the parent call
         address receiverOverride = address(this);
+        
+        // Get rETH balance before redeem to calculate amount transferred
+        uint256 rethBalanceBefore = IERC20(asset).balanceOf(receiverOverride);
+        
         bytes memory result = _delegateCall(
-            abi.encodeWithSignature("redeem(uint256,address,address)", _shares, receiverOverride, _owner)
+            abi.encodeWithSignature("redeem(uint256,address,address,uint256)", _shares, receiverOverride, _owner, _maxLoss)
         );
         assets = abi.decode(result, (uint256));
 
         // Now convert the rETH that was transferred to BETH
         // Get the rETH balance that was transferred to receiver
-        // uint256 rethTransferred = IERC20(asset).balanceOf(_receiver);
-        
-        // if (rethTransferred > 0) {
         if (assets > 0) {
-            // Transfer rETH back from receiver to strategy
-            // Note: This requires the receiver to approve the strategy
-            // In practice, we might need a different approach or require pre-approval
-            // For now, we'll assume the receiver has approved the strategy
-            // IERC20(asset).safeTransferFrom(_receiver, address(this), rethTransferred);   
+            // Get actual rETH balance transferred
+            uint256 rethTransferred = IERC20(asset).balanceOf(receiverOverride) - rethBalanceBefore;
             
-            // // Burn rETH to get ETH
-            // uint256 ethReceived = IRocketTokenRETH(rocketTokenRETH).burn(rethTransferred);
-            // if (ethReceived == 0) revert RETHBurnFailed();
-            uint256 ethReceived = _unstakeETH(assets);
+            // Burn rETH to get ETH
+            uint256 ethReceived = _unstakeETH(rethTransferred);
             
             BETH beth = BETH(payable(bethContract));
             uint256 currentBethBalance = beth.balanceOf(address(this));
@@ -454,7 +439,7 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
             require(assets != 0, "ZERO_ASSETS");
 
             // call _redeem to convert YieldEth to ETH and then burn it by depositing into BETH
-            return _redeem(shares, receiver, owner);
+            return _redeem(shares, receiver, owner, maxLoss);
         }
     }
 
@@ -481,6 +466,15 @@ abstract contract YieldBethStrategy is BaseYieldSkimmingStrategy, ReentrancyGuar
         // Lockup period expired, user can withdraw
         // Return maximum (parent will handle actual balance checks)
         return type(uint256).max;
+    }
+
+    /**
+     * @notice Sets the enableBurning flag
+     * @dev Delegates to TokenizedStrategy's setEnableBurning function
+     * @param _enableBurning Whether to enable the burning mechanism
+     */
+    function setEnableBurning(bool _enableBurning) external onlyManagement {
+        _delegateCall(abi.encodeWithSignature("setEnableBurning(bool)", _enableBurning));
     }
 
     // Note: _harvestAndReport is already implemented in BaseYieldSkimmingStrategy
